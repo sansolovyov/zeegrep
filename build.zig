@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
         .name = "zg",
         .root_module = exe_module,
     });
-    exe.linkLibrary(pcre2_lib);
+    exe.root_module.linkLibrary(pcre2_lib);
     if (output) |out_path| {
         const install = b.addInstallFileWithDir(exe.getEmittedBin(), .prefix, out_path);
         b.getInstallStep().dependOn(&install.step);
@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_tests = b.addTest(.{ .root_module = run_test_module });
-    run_tests.linkLibrary(pcre2_lib);
+    run_tests.root_module.linkLibrary(pcre2_lib);
     const run_run_tests = b.addRunArtifact(run_tests);
 
     const test_step = b.step("test", "Run unit tests");
@@ -63,11 +63,13 @@ pub fn build(b: *std.Build) void {
 }
 
 fn gitVersion(b: *std.Build) []const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = b.allocator,
+    const result = std.process.run(b.allocator, b.graph.io, .{
         .argv = &.{ "git", "describe", "--tags", "--always", "--dirty=+" },
-        .cwd = b.pathFromRoot("."),
+        .cwd = .{ .path = b.pathFromRoot(".") },
     }) catch return "dev";
-    if (result.term.Exited != 0) return "dev";
-    return std.mem.trimRight(u8, result.stdout, "\n\r ");
+    switch (result.term) {
+        .exited => |code| if (code != 0) return "dev",
+        else => return "dev",
+    }
+    return std.mem.trimEnd(u8, result.stdout, "\n\r ");
 }

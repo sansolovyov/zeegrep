@@ -1,4 +1,5 @@
 const std = @import("std");
+const Timer = @import("core/timer.zig");
 const pcre2 = @import("pcre2.zig");
 const ansi = @import("core/ansi.zig");
 const bmh = @import("core/bmh.zig");
@@ -422,7 +423,7 @@ fn findMatchesLiteral(allocator: std.mem.Allocator, hay: []const u8, m: *const b
     const needle_len = m.needle.len;
     if (needle_len == 0) return allocator.alloc(Span, 0);
 
-    var spans: std.ArrayListUnmanaged(Span) = .{};
+    var spans: std.ArrayListUnmanaged(Span) = .empty;
     errdefer spans.deinit(allocator);
 
     var off: usize = 0;
@@ -475,7 +476,7 @@ fn isRegex(pat: []const u8) bool {
 }
 
 pub fn interpretEscapes(allocator: std.mem.Allocator, pat: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < pat.len) : (i += 1) {
@@ -510,7 +511,7 @@ fn replaceLiteral(allocator: std.mem.Allocator, hay: []const u8, m: *const bmh.M
     const needle_len = m.needle.len;
     if (needle_len == 0) return .{ .out = try allocator.dupe(u8, hay), .n = 0 };
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var off: usize = 0;
@@ -530,7 +531,7 @@ fn replaceLiteral(allocator: std.mem.Allocator, hay: []const u8, m: *const bmh.M
 fn expandRef(allocator: std.mem.Allocator, repl: []const u8, match: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, repl, "$0") == null) return repl;
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < repl.len) {
@@ -739,7 +740,7 @@ test "bench iterator high match count" {
 
     // ~1MB with "match" every ~100 bytes = ~10k matches
     const chunk = "some random text here match and more text_";
-    var hay: std.ArrayListUnmanaged(u8) = .{};
+    var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
     for (0..25000) |_| try hay.appendSlice(alloc, chunk);
     const data = hay.items;
@@ -751,7 +752,7 @@ test "bench iterator high match count" {
     var lit = try compile(alloc, "match", false, false);
     defer lit.deinit();
 
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(std.testing.io);
     var count: usize = 0;
     var it = MatchIterator.init(&lit, data);
     defer it.deinit();
@@ -787,18 +788,18 @@ test "bench regex literal optimization" {
     // - "metabase" (actual match for ..tabase)
     // - "database" (contains "tabase" but different prefix - false positive for literal scan)
     // - "notable" (no "tabase" - should skip)
-    var hay: std.ArrayListUnmanaged(u8) = .{};
+    var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
 
     const lines_per_type = 10000;
     // Mix of matching and non-matching lines
     for (0..lines_per_type) |i| {
         // Line with actual match
-        try hay.writer(alloc).print("line {d}: the metabase server is running\n", .{i * 3});
+        try hay.print(alloc, "line {d}: the metabase server is running\n", .{i * 3});
         // Line with literal but no match (database has "tabase" but not ..tabase pattern)
-        try hay.writer(alloc).print("line {d}: connect to database system\n", .{i * 3 + 1});
+        try hay.print(alloc, "line {d}: connect to database system\n", .{i * 3 + 1});
         // Line without literal
-        try hay.writer(alloc).print("line {d}: some random text here\n", .{i * 3 + 2});
+        try hay.print(alloc, "line {d}: some random text here\n", .{i * 3 + 2});
     }
     const data = hay.items;
 
@@ -813,7 +814,7 @@ test "bench regex literal optimization" {
     try std.testing.expect(pat.regex.literal != null);
     try std.testing.expectEqualStrings("tabase", pat.regex.literal.?.needle);
 
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(std.testing.io);
     var count: usize = 0;
     var it = MatchIterator.init(&pat, data);
     defer it.deinit();
@@ -838,20 +839,20 @@ test "bench inner literal seek" {
 
     // Test pattern: xx.+tabase (prefix "xx", inner ".+", then "tabase")
     // This tests inner literal when there's a safe prefix before the greedy part
-    var hay: std.ArrayListUnmanaged(u8) = .{};
+    var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
 
     const total_lines = 30000;
     for (0..total_lines) |i| {
         if (i % 100 == 0) {
             // Actual match
-            try hay.writer(alloc).print("line {d}: xxmetabase server\n", .{i});
+            try hay.print(alloc, "line {d}: xxmetabase server\n", .{i});
         } else if (i % 10 == 0) {
             // Has "tabase" but no "xx" prefix
-            try hay.writer(alloc).print("line {d}: database system\n", .{i});
+            try hay.print(alloc, "line {d}: database system\n", .{i});
         } else {
             // No literal
-            try hay.writer(alloc).print("line {d}: random text content\n", .{i});
+            try hay.print(alloc, "line {d}: random text content\n", .{i});
         }
     }
     const data = hay.items;
@@ -865,7 +866,7 @@ test "bench inner literal seek" {
     try std.testing.expect(pat.regex.literal != null);
     try std.testing.expectEqualStrings("tabase", pat.regex.literal.?.needle);
 
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(std.testing.io);
     var count: usize = 0;
     var it = MatchIterator.init(&pat, data);
     defer it.deinit();
@@ -913,19 +914,19 @@ test "bench greedy pattern optimization" {
     // Compare with raw PCRE2 (no optimization) to show speedup.
     const alloc = std.testing.allocator;
 
-    var hay: std.ArrayListUnmanaged(u8) = .{};
+    var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
 
     const total_lines = 5000;
     for (0..total_lines) |i| {
         if (i % 100 == 0) {
             // Matches: has chars before AND after "metabase"
-            try hay.writer(alloc).print("line {d}: the metabase server\n", .{i});
+            try hay.print(alloc, "line {d}: the metabase server\n", .{i});
         } else if (i % 20 == 0) {
             // Has literal but won't match (at line start, no .+ before)
-            try hay.writer(alloc).print("metabase documentation {d}\n", .{i});
+            try hay.print(alloc, "metabase documentation {d}\n", .{i});
         } else {
-            try hay.writer(alloc).print("line {d}: random content\n", .{i});
+            try hay.print(alloc, "line {d}: random content\n", .{i});
         }
     }
     const data = hay.items;
@@ -937,7 +938,7 @@ test "bench greedy pattern optimization" {
     defer pat.deinit();
     try std.testing.expect(pat.regex.literal != null);
 
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(std.testing.io);
     var count: usize = 0;
     var it = MatchIterator.init(&pat, data);
     defer it.deinit();
@@ -972,15 +973,15 @@ test "bench prefix vs inner literal" {
     const alloc = std.testing.allocator;
 
     // Compare: prefix literal (meta.+se) vs inner literal (..tabase)
-    var hay: std.ArrayListUnmanaged(u8) = .{};
+    var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
 
     const total_lines = 30000;
     for (0..total_lines) |i| {
         if (i % 50 == 0) {
-            try hay.writer(alloc).print("line {d}: metabase metaverse metadata\n", .{i});
+            try hay.print(alloc, "line {d}: metabase metaverse metadata\n", .{i});
         } else {
-            try hay.writer(alloc).print("line {d}: unrelated content here\n", .{i});
+            try hay.print(alloc, "line {d}: unrelated content here\n", .{i});
         }
     }
     const data = hay.items;
@@ -991,7 +992,7 @@ test "bench prefix vs inner literal" {
     var pat1 = try compile(alloc, "meta.+se", false, false);
     defer pat1.deinit();
 
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(std.testing.io);
     var count1: usize = 0;
     var it1 = MatchIterator.init(&pat1, data);
     defer it1.deinit();

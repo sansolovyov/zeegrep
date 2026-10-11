@@ -1,4 +1,5 @@
 const std = @import("std");
+const Timer = @import("timer.zig");
 
 pub const Matcher = struct {
     needle: []const u8,
@@ -174,7 +175,7 @@ test "bench bmh vs naive" {
     // Generate ~1MB haystack with pattern every ~1KB
     const chunk = "abcdefghijklmnopqrstuvwxyz0123456789_" ** 28; // ~1KB
     const needle = "PATTERN_HERE";
-    var hay: std.ArrayListUnmanaged(u8) = .{};
+    var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
     for (0..1000) |_| {
         try hay.appendSlice(alloc, chunk);
@@ -190,7 +191,7 @@ test "bench bmh vs naive" {
     // case-sensitive
     {
         const m = Matcher.init(needle, false);
-        var timer = try std.time.Timer.start();
+        var timer = Timer.start(std.testing.io);
         for (0..iters) |_| _ = m.count(data);
         bmh_ns = timer.read();
 
@@ -210,7 +211,7 @@ test "bench bmh vs naive" {
     // case-insensitive
     {
         const m = Matcher.init(needle, true);
-        var timer = try std.time.Timer.start();
+        var timer = Timer.start(std.testing.io);
         for (0..iters) |_| _ = m.count(data);
         bmh_ns = timer.read();
 

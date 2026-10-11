@@ -138,10 +138,10 @@ const LineSlices = struct {
 
 test "diff simple line change" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "a\nb\nc\n", "a\nbb\nc\n", 0, 0);
+    var fbs = std.Io.Writer.fixed(&buf);
+    const n = try printChangedLines(&fbs, false, "x.txt", "a\nb\nc\n", "a\nbb\nc\n", 0, 0);
     try std.testing.expectEqual(@as(usize, 1), n);
-    const s = fbs.getWritten();
+    const s = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, s, "x.txt:2") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "- b") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "+ bb") != null);
@@ -149,11 +149,11 @@ test "diff simple line change" {
 
 test "diff multiline to single line" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var fbs = std.Io.Writer.fixed(&buf);
     // Replace 3 lines with 1 line
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "a\nb\nc\nd\n", "a\nX\nd\n", 0, 0);
+    const n = try printChangedLines(&fbs, false, "x.txt", "a\nb\nc\nd\n", "a\nX\nd\n", 0, 0);
     try std.testing.expectEqual(@as(usize, 1), n);
-    const s = fbs.getWritten();
+    const s = fbs.buffered();
 
     const expected =
         \\── x.txt:2-3 ──
@@ -167,11 +167,11 @@ test "diff multiline to single line" {
 
 test "diff single line to multiline" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var fbs = std.Io.Writer.fixed(&buf);
     // Replace 1 line with 3 lines
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "a\nX\nd\n", "a\nb\nc\nd\n", 0, 0);
+    const n = try printChangedLines(&fbs, false, "x.txt", "a\nX\nd\n", "a\nb\nc\nd\n", 0, 0);
     try std.testing.expectEqual(@as(usize, 1), n);
-    const s = fbs.getWritten();
+    const s = fbs.buffered();
 
     const expected =
         \\── x.txt:2 ──
@@ -185,10 +185,10 @@ test "diff single line to multiline" {
 
 test "diff with context" {
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "1\n2\n3\n4\n5\n", "1\n2\nX\n4\n5\n", 1, 1);
+    var fbs = std.Io.Writer.fixed(&buf);
+    const n = try printChangedLines(&fbs, false, "x.txt", "1\n2\n3\n4\n5\n", "1\n2\nX\n4\n5\n", 1, 1);
     try std.testing.expectEqual(@as(usize, 1), n);
-    const s = fbs.getWritten();
+    const s = fbs.buffered();
 
     const expected =
         \\── x.txt:2-4 ──
@@ -203,13 +203,13 @@ test "diff with context" {
 
 test "diff multiline replacement with context" {
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var fbs = std.Io.Writer.fixed(&buf);
     // old has 3 lines that become 1, with context
     const old = "header\nold {\n    body\n}\nfooter\n";
     const new = "header\nnew { updated }\nfooter\n";
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", old, new, 1, 1);
+    const n = try printChangedLines(&fbs, false, "x.txt", old, new, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), n);
-    const s = fbs.getWritten();
+    const s = fbs.buffered();
 
     const expected =
         \\── x.txt:1-5 ──
@@ -226,8 +226,8 @@ test "diff multiline replacement with context" {
 
 test "diff no change" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const n = try printChangedLines(fbs.writer(), false, "x.txt", "same\n", "same\n", 0, 0);
+    var fbs = std.Io.Writer.fixed(&buf);
+    const n = try printChangedLines(&fbs, false, "x.txt", "same\n", "same\n", 0, 0);
     try std.testing.expectEqual(@as(usize, 0), n);
-    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+    try std.testing.expectEqual(@as(usize, 0), fbs.buffered().len);
 }

@@ -55,6 +55,8 @@ zg -f pattern              # search for 'pattern' in file name
 
 ## Compile
 
+Requires Zig 0.16.0. With mise, run `mise install` and `mise exec -- zig build`.
+
 ```bash
 # From source
 zig build --release=fast

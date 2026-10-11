@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const Timer = @import("core/timer.zig");
 const engine = @import("engine.zig");
 const diff = @import("diff.zig");
 const core_pool = @import("core/pool.zig");
@@ -87,8 +87,8 @@ pub const Options = struct {
     };
 };
 
-pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Options, pattern: []const u8, paths: []const []const u8) !void {
-    const cwd = std.fs.cwd();
+pub fn run(allocator: std.mem.Allocator, io: std.Io, no_color: bool, writer: *std.Io.Writer, options: Options, pattern: []const u8, paths: []const []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
 
     if (options.file_names and options.replace != null) return error.InvalidArgs;
 
@@ -131,20 +131,18 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
     const before: u32 = if (options.context > 0) options.context else options.before;
     const after: u32 = if (options.context > 0) options.context else options.after;
 
-    const is_tty = std.fs.File.stdout().isTty();
-    const no_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") catch null;
-    defer if (no_color) |v| allocator.free(v);
-    const use_color = ansi.enabled(options.color, is_tty, no_color != null);
-    const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(cwd, paths);
+    const is_tty = std.Io.File.stdout().isTty(io) catch false;
+    const use_color = ansi.enabled(options.color, is_tty, no_color);
+    const use_heading = is_tty and options.replace == null and !options.quiet and !options.count and !options.file_names and isMultiPathSearch(io, cwd, paths);
 
-    var ign_set = core_ignore.Set.init(allocator);
+    var ign_set = core_ignore.Set.init(allocator, io);
     defer ign_set.deinit();
     const ign_root = try ign_set.push(null, cwd, "", core_ignore.all_found);
 
     // Sorted mode: collect paths, sort, process sequentially (streaming output, low memory)
     // Parallel mode: walk and spawn jobs simultaneously
     if (options.sort) {
-        var collected_paths: std.ArrayListUnmanaged([]const u8) = .{};
+        var collected_paths: std.ArrayListUnmanaged([]const u8) = .empty;
         defer {
             for (collected_paths.items) |p| allocator.free(p);
             collected_paths.deinit(allocator);
@@ -153,22 +151,25 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
         const PathCollector = struct {
             paths: *std.ArrayListUnmanaged([]const u8),
             alloc: std.mem.Allocator,
-            cwd: std.fs.Dir,
+            cwd: std.Io.Dir,
+            io: std.Io,
             use_abs: bool,
-            mu: std.Thread.Mutex = .{},
+            mu: std.Io.Mutex = .init,
 
             pub fn onFile(self: *@This(), path: []const u8) void {
-                const p = if (self.use_abs)
-                    self.cwd.realpathAlloc(self.alloc, path) catch return
-                else
-                    self.alloc.dupe(u8, path) catch return;
-                self.mu.lock();
-                defer self.mu.unlock();
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const rel = if (self.use_abs) blk: {
+                    const n = self.cwd.realPathFile(self.io, path, &buf) catch return;
+                    break :blk buf[0..n];
+                } else path;
+                const p = self.alloc.dupe(u8, rel) catch return;
+                self.mu.lockUncancelable(self.io);
+                defer self.mu.unlock(self.io);
                 self.paths.append(self.alloc, p) catch self.alloc.free(p);
             }
         };
-        var collector = PathCollector{ .paths = &collected_paths, .alloc = allocator, .cwd = cwd, .use_abs = options.abs };
-        try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, walk_threads_search, &collector);
+        var collector = PathCollector{ .paths = &collected_paths, .alloc = allocator, .cwd = cwd, .io = io, .use_abs = options.abs };
+        try core_walk.walkFiles(allocator, io, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, walk_threads_search, &collector);
 
         std.mem.sort([]const u8, collected_paths.items, {}, struct {
             fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -186,7 +187,7 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         for (collected_paths.items) |path| {
-            processFile(arena.allocator(), &state, path, all_patterns, options, use_color, use_heading, before, after, writer);
+            processFile(arena.allocator(), io, &state, path, all_patterns, options, use_color, use_heading, before, after, writer);
             _ = arena.reset(.retain_capacity);
         }
 
@@ -205,10 +206,10 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
 
     var pool: core_pool.Pool = .{};
     const n_jobs = @min(max_parallelism, std.Thread.getCpuCount() catch max_parallelism);
-    try pool.init(allocator, n_jobs);
+    try pool.init(allocator, io, n_jobs);
     defer pool.deinit();
 
-    var shared = Shared.init(shared_alloc, &pool, before, after, use_color, use_heading, processed_replace, writer);
+    var shared = Shared.init(shared_alloc, io, before, after, use_color, use_heading, processed_replace, writer);
 
     var scope = pool.scope();
 
@@ -218,12 +219,18 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
         patterns: []const engine.Pattern,
         opts: Options,
         allocator: std.mem.Allocator,
-        cwd: std.fs.Dir,
+        cwd: std.Io.Dir,
+        io: std.Io,
 
         pub fn onFile(self: *@This(), path: []const u8) void {
             const p = self.allocator.dupe(u8, path) catch return;
             if (self.opts.abs) {
-                const abs = self.cwd.realpathAlloc(self.allocator, p) catch {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = self.cwd.realPathFile(self.io, p, &buf) catch {
+                    self.allocator.free(p);
+                    return;
+                };
+                const abs = self.allocator.dupe(u8, buf[0..n]) catch {
                     self.allocator.free(p);
                     return;
                 };
@@ -241,8 +248,9 @@ pub fn run(allocator: std.mem.Allocator, writer: *std.io.Writer, options: Option
         .opts = options,
         .allocator = shared_alloc,
         .cwd = cwd,
+        .io = io,
     };
-    try core_walk.walkFiles(allocator, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, if (options.file_names) walk_threads_listing else walk_threads_search, &walker);
+    try core_walk.walkFiles(allocator, io, cwd, &ign_set, ign_root, paths, options.include.constSlice(), options.exclude.constSlice(), options.hidden, if (options.file_names) walk_threads_listing else walk_threads_search, &walker);
     scope.wait();
 
     if (options.replace != null and !options.quiet) {
@@ -263,15 +271,15 @@ const StreamState = struct {
 
 const Shared = struct {
     allocator: std.mem.Allocator,
-    pool: *core_pool.Pool,
+    io: std.Io,
     before: u32,
     after: u32,
     color: bool,
     heading: bool,
     replace: ?[]const u8,
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
 
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
     first_out: bool = true,
 
     total_matches: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -279,8 +287,8 @@ const Shared = struct {
     files_changed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     had_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn init(allocator: std.mem.Allocator, pool: *core_pool.Pool, before: u32, after: u32, color: bool, heading: bool, replace: ?[]const u8, writer: *std.io.Writer) Shared {
-        return .{ .allocator = allocator, .pool = pool, .before = before, .after = after, .color = color, .heading = heading, .replace = replace, .writer = writer };
+    fn init(allocator: std.mem.Allocator, io: std.Io, before: u32, after: u32, color: bool, heading: bool, replace: ?[]const u8, writer: *std.Io.Writer) Shared {
+        return .{ .allocator = allocator, .io = io, .before = before, .after = after, .color = color, .heading = heading, .replace = replace, .writer = writer };
     }
 
     fn add(self: *Shared, matches: usize, repls: usize, changed: bool) void {
@@ -290,8 +298,8 @@ const Shared = struct {
     }
 
     fn output(self: *Shared, out: []const u8) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
 
         if (!self.first_out) {
             if (self.heading) {
@@ -312,10 +320,8 @@ const Shared = struct {
 };
 
 const Job = struct {
-    fn run(thread_id: usize, shared: *Shared, path: []const u8, options: Options, patterns: []const engine.Pattern) void {
+    fn run(arena: *std.heap.ArenaAllocator, shared: *Shared, path: []const u8, options: Options, patterns: []const engine.Pattern) void {
         defer shared.allocator.free(path); // path was duped by walker
-        const arena = shared.pool.arena(thread_id);
-        defer _ = arena.reset(.retain_capacity);
         work(arena.allocator(), shared, path, options, patterns) catch |e| {
             if (options.debug) debugSkip(path, @errorName(e));
             shared.fail();
@@ -337,29 +343,29 @@ const Job = struct {
             const n = engine.countMatches(active_pat, path, options.ignore_case);
             shared.add(n, 0, false);
             if (options.count and !options.quiet) {
-                var buf: std.ArrayListUnmanaged(u8) = .{};
-                const w = buf.writer(tmp);
+                var buf = std.Io.Writer.Allocating.init(tmp);
+                const w = &buf.writer;
                 try w.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, n) });
-                shared.output(buf.items);
+                shared.output(buf.written());
                 return;
             }
             if (!options.quiet and !options.count) {
-                var buf: std.ArrayListUnmanaged(u8) = .{};
-                const w = buf.writer(tmp);
+                var buf = std.Io.Writer.Allocating.init(tmp);
+                const w = &buf.writer;
                 try w.print("{f}\n", .{ansi.styled(shared.color, .path, path)});
-                shared.output(buf.items);
+                shared.output(buf.written());
                 return;
             }
             return;
         }
 
-        var f = std.fs.cwd().openFile(path, .{}) catch |e| {
+        var f = std.Io.Dir.cwd().openFile(shared.io, path, .{}) catch |e| {
             if (options.debug) debugSkip(path, @errorName(e));
             return;
         };
-        defer f.close();
+        defer f.close(shared.io);
 
-        const stat = f.stat() catch |e| {
+        const stat = f.stat(shared.io) catch |e| {
             if (options.debug) debugSkip(path, @errorName(e));
             return;
         };
@@ -369,11 +375,11 @@ const Job = struct {
             return;
         }
 
-        const file_data = mapFile(tmp, f, stat.size) catch |e| {
+        var file_data = mapFile(tmp, shared.io, f, stat.size) catch |e| {
             if (options.debug) debugSkip(path, @errorName(e));
             return;
         };
-        defer unmapFile(file_data);
+        defer unmapFile(shared.io, &file_data);
         const data = file_data.ptr;
 
         if (isBinary(data)) {
@@ -391,13 +397,13 @@ const Job = struct {
             const rr = try engine.replaceAll(tmp, active_pat, data, repl, options.ignore_case);
             if (rr.n == 0) return;
 
-            if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
+            if (!options.dry_run) try writeAtomic(shared.io, path, rr.out);
 
             shared.add(0, rr.n, true);
             if (options.dry_run and !options.quiet) {
-                var buf: std.ArrayListUnmanaged(u8) = .{};
-                _ = try diff.printChangedLines(buf.writer(tmp), shared.color, path, data, rr.out, shared.before, shared.after);
-                shared.output(buf.items);
+                var buf = std.Io.Writer.Allocating.init(tmp);
+                _ = try diff.printChangedLines(&buf.writer, shared.color, path, data, rr.out, shared.before, shared.after);
+                shared.output(buf.written());
                 return;
             }
             return;
@@ -406,22 +412,23 @@ const Job = struct {
         const has_context = shared.before > 0 or shared.after > 0;
 
         // Stream matches to buffer, then output
-        var out: std.ArrayListUnmanaged(u8) = .{};
-        const match_count = try streamMatchesMulti(out.writer(tmp), shared.color, shared.heading, has_context, path, patterns, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count, null);
+        var out = std.Io.Writer.Allocating.init(tmp);
+        const match_count = try streamMatchesMulti(&out.writer, shared.color, shared.heading, has_context, path, patterns, data, shared.before, shared.after, options.ignore_case, options.quiet or options.count, null);
         if (match_count == 0) return;
         shared.add(match_count, 0, false);
         if (options.quiet) return;
         if (options.count) {
-            out.clearRetainingCapacity();
-            try out.writer(tmp).print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, match_count) });
+            out.writer.end = 0;
+            try out.writer.print("{f}:{f}\n", .{ ansi.styled(shared.color, .path, path), ansi.styled(shared.color, .line_no, match_count) });
         }
-        if (out.items.len > 0) shared.output(out.items);
+        if (out.written().len > 0) shared.output(out.written());
     }
 };
 
 /// Single-threaded file processing for sorted mode - streams directly to writer
 fn processFile(
     tmp: std.mem.Allocator,
+    io: std.Io,
     state: *StreamState,
     path: []const u8,
     patterns: []const engine.Pattern,
@@ -430,9 +437,9 @@ fn processFile(
     heading: bool,
     before: u32,
     after: u32,
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
 ) void {
-    processFileInner(tmp, state, path, patterns, options, color, heading, before, after, writer) catch |e| {
+    processFileInner(tmp, io, state, path, patterns, options, color, heading, before, after, writer) catch |e| {
         if (options.debug) std.debug.print("DEBUG: {s}: {s}\n", .{ path, @errorName(e) });
         state.had_error = true;
     };
@@ -440,6 +447,7 @@ fn processFile(
 
 fn processFileInner(
     tmp: std.mem.Allocator,
+    io: std.Io,
     state: *StreamState,
     path: []const u8,
     patterns: []const engine.Pattern,
@@ -448,7 +456,7 @@ fn processFileInner(
     heading: bool,
     before: u32,
     after: u32,
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
 ) !void {
     const active_pat = &patterns[patterns.len - 1]; // last pattern for replace
 
@@ -470,15 +478,15 @@ fn processFileInner(
         return;
     }
 
-    var f = std.fs.cwd().openFile(path, .{}) catch return;
-    defer f.close();
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
+    defer f.close(io);
 
-    const stat = f.stat() catch return;
+    const stat = f.stat(io) catch return;
     if (stat.size == 0) return;
     if (stat.size > max_file_size) return;
 
-    const file_data = mapFile(tmp, f, stat.size) catch return;
-    defer unmapFile(file_data);
+    var file_data = mapFile(tmp, io, f, stat.size) catch return;
+    defer unmapFile(io, &file_data);
     const data = file_data.ptr;
 
     if (isBinary(data)) return;
@@ -493,7 +501,7 @@ fn processFileInner(
         const rr = try engine.replaceAll(tmp, active_pat, data, repl, options.ignore_case);
         if (rr.n == 0) return;
 
-        if (!options.dry_run) try writeAtomic(tmp, path, rr.out);
+        if (!options.dry_run) try writeAtomic(io, path, rr.out);
 
         state.total_repls += rr.n;
         state.files_changed += 1;
@@ -522,7 +530,7 @@ fn processFileInner(
     // streamMatches already wrote output with separators
 }
 
-fn writeSeparator(state: *StreamState, writer: *std.io.Writer, color: bool, heading: bool, before: u32, after: u32) !void {
+fn writeSeparator(state: *StreamState, writer: *std.Io.Writer, color: bool, heading: bool, before: u32, after: u32) !void {
     if (!state.first_out) {
         if (heading) {
             try writer.writeByte('\n');
@@ -696,7 +704,7 @@ fn streamMatchesMulti(
 
     // Collect all match line numbers from all patterns
     const MatchLine = struct { line: usize, offset: usize };
-    var match_lines: std.ArrayListUnmanaged(MatchLine) = .{};
+    var match_lines: std.ArrayListUnmanaged(MatchLine) = .empty;
     defer match_lines.deinit(std.heap.page_allocator);
 
     var tracker = LineTracker{};
@@ -825,7 +833,7 @@ fn writeHighlightedMulti(on: bool, patterns: []const engine.Pattern, writer: any
 
     // Collect all highlight ranges: (start, end, pattern_idx)
     const Range = struct { start: usize, end: usize, pat_idx: usize };
-    var ranges: std.ArrayListUnmanaged(Range) = .{};
+    var ranges: std.ArrayListUnmanaged(Range) = .empty;
     defer ranges.deinit(std.heap.page_allocator);
 
     for (patterns, 0..) |*pat, pat_idx| {
@@ -963,108 +971,86 @@ fn isBinary(data: []const u8) bool {
 
 const FileData = struct {
     ptr: []const u8,
-    mapped: bool = true,
-    section_handle: if (builtin.os.tag == .windows) std.os.windows.HANDLE else void = if (builtin.os.tag == .windows) undefined else {},
+    map: ?std.Io.File.MemoryMap = null,
 };
 
-/// Files below this size are read into a (reused) arena buffer: cheaper than
-/// mmap+munmap, which serializes on the process address-space lock across threads.
+/// Small files avoid mapping overhead; buffers are reused by the job arena.
 const small_file_max = 64 * 1024;
 
-fn mapFile(tmp: std.mem.Allocator, f: std.fs.File, size: u64) !FileData {
+fn mapFile(tmp: std.mem.Allocator, io: std.Io, f: std.Io.File, size: u64) !FileData {
     if (size <= small_file_max) {
         const buf = try tmp.alloc(u8, size);
-        var off: usize = 0;
-        while (off < size) {
-            const n = try f.read(buf[off..]);
-            if (n == 0) break;
-            off += n;
-        }
-        return .{ .ptr = buf[0..off], .mapped = false };
+        const n = try f.readPositionalAll(io, buf, 0);
+        return .{ .ptr = buf[0..n] };
     }
-    if (comptime builtin.os.tag == .windows) {
-        const w = std.os.windows;
-        var section_handle: w.HANDLE = undefined;
-        const create_rc = w.ntdll.NtCreateSection(
-            &section_handle,
-            w.STANDARD_RIGHTS_REQUIRED | w.SECTION_QUERY | w.SECTION_MAP_READ,
-            null,
-            null,
-            w.PAGE_READONLY,
-            w.SEC_COMMIT,
-            f.handle,
-        );
-        if (create_rc != .SUCCESS) return error.MmapFailed;
-        errdefer w.CloseHandle(section_handle);
-
-        var view_size: usize = 0;
-        var base_ptr: usize = 0;
-        const map_rc = w.ntdll.NtMapViewOfSection(
-            section_handle,
-            w.GetCurrentProcess(),
-            @ptrCast(&base_ptr),
-            null,
-            0,
-            null,
-            &view_size,
-            .ViewUnmap,
-            0,
-            w.PAGE_READONLY,
-        );
-        if (map_rc != .SUCCESS) return error.MmapFailed;
-
-        return .{
-            .ptr = @as([*]const u8, @ptrFromInt(base_ptr))[0..size],
-            .section_handle = section_handle,
-        };
-    } else {
-        const data = try std.posix.mmap(null, size, std.c.PROT.READ, .{ .TYPE = .PRIVATE }, f.handle, 0);
-        return .{ .ptr = data };
-    }
+    const map = try f.createMemoryMap(io, .{
+        .len = @intCast(size),
+        .protection = .{ .read = true },
+        .populate = false,
+    });
+    return .{ .ptr = map.memory, .map = map };
 }
 
-fn unmapFile(fd: FileData) void {
-    if (!fd.mapped) return; // arena-owned, freed on reset
-    if (comptime builtin.os.tag == .windows) {
-        const w = std.os.windows;
-        _ = w.ntdll.NtUnmapViewOfSection(w.GetCurrentProcess(), @ptrFromInt(@intFromPtr(fd.ptr.ptr)));
-        w.CloseHandle(fd.section_handle);
-    } else {
-        std.posix.munmap(@alignCast(@constCast(fd.ptr)));
-    }
+fn unmapFile(io: std.Io, data: *FileData) void {
+    if (data.map) |*map| map.destroy(io);
 }
 
-fn writeAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+fn writeAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
     const base = std.fs.path.basename(path);
 
-    var d = try std.fs.cwd().openDir(parent, .{});
-    defer d.close();
-    try core_atomic.replaceFileAtomic(allocator, d, base, data);
+    var d = try std.Io.Dir.cwd().openDir(io, parent, .{});
+    defer d.close(io);
+    try core_atomic.replaceFileAtomic(io, d, base, data);
+}
+
+test "small reads and large memory maps preserve bytes across atomic replacement" {
+    const io = std.testing.io;
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    for ([_]usize{ 1024, small_file_max + 1 }) |size| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const bytes = try arena.allocator().alloc(u8, size);
+        @memset(bytes, 'a');
+        bytes[size - 1] = 'z';
+        try td.dir.writeFile(io, .{ .sub_path = "x.txt", .data = bytes });
+        const file = try td.dir.openFile(io, "x.txt", .{});
+        defer file.close(io);
+        var data = try mapFile(arena.allocator(), io, file, size);
+        defer unmapFile(io, &data);
+        try std.testing.expectEqual(size > small_file_max, data.map != null);
+        try std.testing.expectEqualStrings(bytes, data.ptr);
+        try core_atomic.replaceFileAtomic(io, td.dir, "x.txt", "new");
+        try std.testing.expectEqualStrings(bytes, data.ptr);
+        var buf: [16]u8 = undefined;
+        try std.testing.expectEqualStrings("new", try td.dir.readFile(io, "x.txt", &buf));
+    }
 }
 
 test "search and replace tmpdir" {
-    const cwd = std.fs.cwd();
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
 
     var name_buf: [64]u8 = undefined;
-    const root = try std.fmt.bufPrint(&name_buf, "tmp-zg-test-{d}", .{std.time.milliTimestamp()});
-    cwd.makeDir(root) catch {};
-    defer cwd.deleteTree(root) catch {};
+    const root = try std.fmt.bufPrint(&name_buf, "tmp-zg-test-{d}", .{std.Io.Clock.real.now(io).toMilliseconds()});
+    cwd.createDir(io, root, .default_dir) catch {};
+    defer cwd.deleteTree(io, root) catch {};
 
     var pbuf: [128]u8 = undefined;
     const a = try std.fmt.bufPrint(&pbuf, "{s}/a.txt", .{root});
-    try cwd.writeFile(.{ .sub_path = a, .data = "foo1\nxx\nfoo2\n" });
+    try cwd.writeFile(io, .{ .sub_path = a, .data = "foo1\nxx\nfoo2\n" });
     const b = try std.fmt.bufPrint(&pbuf, "{s}/b.txt", .{root});
-    try cwd.writeFile(.{ .sub_path = b, .data = "nope\n" });
+    try cwd.writeFile(io, .{ .sub_path = b, .data = "nope\n" });
 
     var o = Options{ .sort = true, .color = .never };
     try o.include.append(".txt");
 
     var buf: [2048]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
 
     // Search
-    _ = run(std.testing.allocator, &w, o, "foo", &.{root}) catch |e| {
+    _ = run(std.testing.allocator, io, false, &w, o, "foo", &.{root}) catch |e| {
         try std.testing.expect(e != error.NoMatches);
         return e;
     };
@@ -1077,7 +1063,7 @@ test "search and replace tmpdir" {
     w.end = 0;
     o.replace = "bar$1";
     o.dry_run = true;
-    _ = run(std.testing.allocator, &w, o, "foo(\\d+)", &.{root}) catch {};
+    _ = run(std.testing.allocator, io, false, &w, o, "foo(\\d+)", &.{root}) catch {};
     out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "replacements") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "──") != null);
@@ -1087,7 +1073,7 @@ test "search and replace tmpdir" {
     o.replace = null;
     o.dry_run = false;
     o.count = true;
-    _ = run(std.testing.allocator, &w, o, "foo", &.{root}) catch {};
+    _ = run(std.testing.allocator, io, false, &w, o, "foo", &.{root}) catch {};
     out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt:2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "b.txt") == null);
@@ -1096,7 +1082,7 @@ test "search and replace tmpdir" {
     w.end = 0;
     o.count = false;
     o.file_names = true;
-    _ = run(std.testing.allocator, &w, o, "a.txt", &.{root}) catch {};
+    _ = run(std.testing.allocator, io, false, &w, o, "a.txt", &.{root}) catch {};
     out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
 
@@ -1104,16 +1090,16 @@ test "search and replace tmpdir" {
     w.end = 0;
     o.file_names = false;
     o.sort = false;
-    _ = run(std.testing.allocator, &w, o, "foo", &.{root}) catch {};
+    _ = run(std.testing.allocator, io, false, &w, o, "foo", &.{root}) catch {};
     out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "foo1") != null);
 }
 
-fn isMultiPathSearch(cwd: std.fs.Dir, paths: []const []const u8) bool {
+fn isMultiPathSearch(io: std.Io, cwd: std.Io.Dir, paths: []const []const u8) bool {
     if (paths.len == 0) return true;
     for (paths) |p| {
-        const st = cwd.statFile(p) catch continue;
+        const st = cwd.statFile(io, p, .{}) catch continue;
         if (st.kind == .directory) return true;
     }
     return false;
@@ -1123,7 +1109,7 @@ test "bench LineTracker vs naive offsetToLine" {
     const alloc = std.testing.allocator;
 
     // Generate ~1MB with ~10k lines
-    var hay: std.ArrayListUnmanaged(u8) = .{};
+    var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
     for (0..10000) |_| try hay.appendSlice(alloc, "this is a line of text with some content here\n");
     const data = hay.items;
@@ -1136,7 +1122,7 @@ test "bench LineTracker vs naive offsetToLine" {
     std.debug.print("\nbench LineTracker: {d}KB, {d} lines, {d} lookups\n", .{ data.len / 1024, line_count, offsets.len });
 
     // Naive: O(n) per lookup
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(std.testing.io);
     var sum: usize = 0;
     for (offsets) |off| sum += offsetToLine(data, off);
     const naive_ns = timer.read();

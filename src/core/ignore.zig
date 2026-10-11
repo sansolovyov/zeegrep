@@ -50,11 +50,12 @@ pub const Node = struct {
 /// directories that actually contain rules allocate one, so a tree with 169
 /// gitignores costs tens of KB.
 pub const Set = struct {
+    io: std.Io,
     arena: std.heap.ArenaAllocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
-    pub fn init(allocator: std.mem.Allocator) Set {
-        return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Set {
+        return .{ .io = io, .arena = std.heap.ArenaAllocator.init(allocator) };
     }
 
     pub fn deinit(self: *Set) void {
@@ -65,22 +66,22 @@ pub const Set = struct {
     /// Returns the node covering `dir`, or `parent` when `dir` adds no rules.
     /// `found` tells which ignore files the caller saw in the directory listing,
     /// so we don't pay an openat() per missing one.
-    pub fn push(self: *Set, parent: ?*const Node, dir: std.fs.Dir, base_rel: []const u8, found: Found) !?*const Node {
+    pub fn push(self: *Set, parent: ?*const Node, dir: std.Io.Dir, base_rel: []const u8, found: Found) !?*const Node {
         var any = false;
         for (found) |f| any = any or f;
         if (!any) return parent;
 
-        var rules: std.ArrayListUnmanaged(Rule) = .{};
+        var rules: std.ArrayListUnmanaged(Rule) = .empty;
         const scratch = self.arena.child_allocator;
 
         // Rules live in the arena, so hold the lock while parsing. Only dirs that
         // actually have ignore files get here, so contention is negligible.
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const alloc = self.arena.allocator();
 
         for (names, found) |name, present| {
-            if (present) try load(alloc, scratch, &rules, dir, name);
+            if (present) try load(self.io, alloc, scratch, &rules, dir, name);
         }
         if (rules.items.len == 0) return parent;
 
@@ -94,13 +95,14 @@ pub const Set = struct {
     }
 
     fn load(
+        io: std.Io,
         alloc: std.mem.Allocator,
         scratch: std.mem.Allocator,
         rules: *std.ArrayListUnmanaged(Rule),
-        dir: std.fs.Dir,
+        dir: std.Io.Dir,
         name: []const u8,
     ) !void {
-        const data = dir.readFileAlloc(scratch, name, 1 << 20) catch |e| switch (e) {
+        const data = dir.readFileAlloc(io, name, scratch, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => return,
             else => return e,
         };
@@ -186,31 +188,31 @@ fn defaultSkip(rel_path: []const u8) bool {
 }
 
 test "chain honors per-dir ignore" {
+    const io = std.testing.io;
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
 
-    try td.dir.makeDir("a");
-    try td.dir.makeDir("a/b");
-    try td.dir.writeFile(.{ .sub_path = ".gitignore", .data = "*.log\n" });
-    try td.dir.writeFile(.{ .sub_path = "a/.gitignore", .data = "!keep.log\n" });
+    try td.dir.createDir(io, "a", .default_dir);
+    try td.dir.createDir(io, "a/b", .default_dir);
+    try td.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try td.dir.writeFile(io, .{ .sub_path = "a/.gitignore", .data = "!keep.log\n" });
 
-    var set = Set.init(std.testing.allocator);
+    var set = Set.init(std.testing.allocator, std.testing.io);
     defer set.deinit();
     const root = try set.push(null, td.dir, "", all_found);
 
     try std.testing.expect(Node.ignored(root, "x.log", false, true));
     try std.testing.expect(Node.ignored(root, "a/x.log", false, true));
 
-    var a = try td.dir.openDir("a", .{ .iterate = true });
-    defer a.close();
+    var a = try td.dir.openDir(io, "a", .{ .iterate = true });
+    defer a.close(io);
     const node_a = try set.push(root, a, "a", all_found);
 
     try std.testing.expect(!Node.ignored(node_a, "a/keep.log", false, true));
     try std.testing.expect(Node.ignored(node_a, "a/nope.log", false, true));
 
     // A dir without ignore files must not allocate a node
-    var b = try a.openDir("b", .{ .iterate = true });
-    defer b.close();
+    var b = try a.openDir(io, "b", .{ .iterate = true });
+    defer b.close(io);
     try std.testing.expectEqual(node_a, try set.push(node_a, b, "a/b", .{false} ** names.len));
 }
-

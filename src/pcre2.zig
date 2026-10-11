@@ -160,7 +160,7 @@ pub fn findMatches(allocator: std.mem.Allocator, code: *const Code, subject: []c
     const md = c.pcre2_match_data_create_from_pattern_8(code.code.?, null) orelse return error.OutOfMemory;
     defer c.pcre2_match_data_free_8(md);
 
-    var spans: std.ArrayListUnmanaged(Span) = .{};
+    var spans: std.ArrayListUnmanaged(Span) = .empty;
     errdefer spans.deinit(allocator);
 
     var off: usize = 0;
@@ -296,4 +296,3 @@ test "pcre2 replace and count" {
     try std.testing.expectEqual(@as(usize, 2), rr.n);
     try std.testing.expectEqualStrings("bar12 bar bar34", rr.out);
 }
-

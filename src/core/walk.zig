@@ -14,9 +14,10 @@ const Task = struct {
 /// when nothing is queued and no worker is still scanning.
 const Queue = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
-    items: std.ArrayListUnmanaged(Task) = .{},
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    items: std.ArrayListUnmanaged(Task) = .empty,
     busy: usize = 0,
     /// Workers blocked in pop(). Read without the lock to decide whether
     /// sharing a subdirectory is worth the path copy.
@@ -33,45 +34,46 @@ const Queue = struct {
 
     /// Takes ownership of `path`.
     fn push(self: *Queue, path: []u8, node: ?*const ignore.Node) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.items.append(self.allocator, .{ .path = path, .node = node }) catch {
             self.allocator.free(path);
             return;
         };
-        self.cond.signal();
+        self.cond.signal(self.io);
     }
 
     /// Blocks until work is available; null when the whole walk is finished.
     fn pop(self: *Queue) ?Task {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         while (true) {
             if (self.items.pop()) |t| {
                 self.busy += 1;
                 return t;
             }
             if (self.busy == 0) {
-                self.cond.broadcast(); // wake the others so they exit too
+                self.cond.broadcast(self.io); // wake the others so they exit too
                 return null;
             }
             _ = self.idle.fetchAdd(1, .monotonic);
-            self.cond.wait(&self.mutex);
+            self.cond.waitUncancelable(self.io, &self.mutex);
             _ = self.idle.fetchSub(1, .monotonic);
         }
     }
 
     fn done(self: *Queue) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.busy -= 1;
-        if (self.busy == 0 and self.items.items.len == 0) self.cond.broadcast();
+        if (self.busy == 0 and self.items.items.len == 0) self.cond.broadcast(self.io);
     }
 };
 
 const Walk = struct {
     allocator: std.mem.Allocator,
-    cwd: std.fs.Dir,
+    io: std.Io,
+    cwd: std.Io.Dir,
     set: *ignore.Set,
     include: []const []const u8,
     exclude: []const []const u8,
@@ -84,7 +86,8 @@ const Walk = struct {
 /// thread-safe; `rel_path` is only valid for the duration of the call.
 pub fn walkFiles(
     allocator: std.mem.Allocator,
-    cwd: std.fs.Dir,
+    io: std.Io,
+    cwd: std.Io.Dir,
     set: *ignore.Set,
     node: ?*const ignore.Node,
     paths: []const []const u8,
@@ -96,12 +99,13 @@ pub fn walkFiles(
 ) !void {
     var w = Walk{
         .allocator = allocator,
+        .io = io,
         .cwd = cwd,
         .set = set,
         .include = include,
         .exclude = exclude,
         .hidden = hidden,
-        .q = .{ .allocator = allocator },
+        .q = .{ .allocator = allocator, .io = io },
     };
     defer w.q.deinit();
 
@@ -110,7 +114,7 @@ pub fn walkFiles(
     } else {
         // Overlapping roots (`zg pat . src`) would otherwise list a directory
         // twice, which for --replace means replacing in the same file twice.
-        const keep = try rootsToWalk(allocator, cwd, paths);
+        const keep = try rootsToWalk(allocator, io, cwd, paths);
         defer allocator.free(keep);
         for (paths, keep) |root, wanted| {
             if (wanted) try seedRoot(&w, node, root, ctx);
@@ -121,7 +125,7 @@ pub fn walkFiles(
     const Worker = struct {
         fn run(walk: *Walk, c: @TypeOf(ctx)) void {
             // Reused across tasks: holds the path of the directory being scanned.
-            var path: std.ArrayListUnmanaged(u8) = .{};
+            var path: std.ArrayListUnmanaged(u8) = .empty;
             defer path.deinit(walk.allocator);
 
             while (walk.q.pop()) |task| {
@@ -147,17 +151,17 @@ pub fn walkFiles(
 /// Marks which roots to actually walk: drops exact duplicates and roots nested
 /// inside another root. Comparison is on resolved paths, so "src", "./src/" and
 /// an absolute path to it are recognized as the same place.
-fn rootsToWalk(allocator: std.mem.Allocator, cwd: std.fs.Dir, paths: []const []const u8) ![]bool {
+fn rootsToWalk(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir, paths: []const []const u8) ![]bool {
     const keep = try allocator.alloc(bool, paths.len);
     @memset(keep, true);
     if (paths.len < 2) return keep;
 
-    const real = try allocator.alloc(?[]u8, paths.len);
+    const real = try allocator.alloc(?[:0]u8, paths.len);
     defer {
         for (real) |r| if (r) |p| allocator.free(p);
         allocator.free(real);
     }
-    for (paths, real) |p, *r| r.* = cwd.realpathAlloc(allocator, p) catch null;
+    for (paths, real) |p, *r| r.* = cwd.realPathFileAlloc(io, p, allocator) catch null;
 
     for (real, 0..) |ri, i| {
         const a = ri orelse continue; // unresolvable: leave it to seedRoot to report
@@ -184,7 +188,7 @@ fn contains(parent: []const u8, child: []const u8) bool {
 }
 
 fn seedRoot(w: *Walk, node: ?*const ignore.Node, root: []const u8, ctx: anytype) !void {
-    const st = w.cwd.statFile(root) catch |e| switch (e) {
+    const st = w.cwd.statFile(w.io, root, .{}) catch |e| switch (e) {
         error.FileNotFound => return,
         else => return e,
     };
@@ -197,7 +201,7 @@ fn seedRoot(w: *Walk, node: ?*const ignore.Node, root: []const u8, ctx: anytype)
     }
 
     // Strip trailing slashes to avoid double-slash paths like "src//file.zig"
-    const trimmed = std.mem.trimRight(u8, root, "/");
+    const trimmed = std.mem.trimEnd(u8, root, "/");
     const prefix = if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) "" else trimmed;
     w.q.push(try w.allocator.dupe(u8, prefix), node);
 }
@@ -205,8 +209,8 @@ fn seedRoot(w: *Walk, node: ?*const ignore.Node, root: []const u8, ctx: anytype)
 /// Opens a queued directory by its full path (once per handoff) and scans it.
 fn scanTask(w: *Walk, path: *std.ArrayListUnmanaged(u8), node: ?*const ignore.Node, ctx: anytype) !void {
     const rel = if (path.items.len == 0) "." else path.items;
-    var dir = try w.cwd.openDir(rel, .{ .iterate = true });
-    defer dir.close();
+    var dir = try w.cwd.openDir(w.io, rel, .{ .iterate = true });
+    defer dir.close(w.io);
     try scanDir(w, dir, path, node, ctx);
 }
 
@@ -214,21 +218,21 @@ fn scanTask(w: *Walk, path: *std.ArrayListUnmanaged(u8), node: ?*const ignore.No
 /// than re-resolving a deep path from cwd. Subdirs are only handed to the queue
 /// when another worker is idle, so the handoff cost is paid only when it buys
 /// parallelism.
-fn scanDir(w: *Walk, dir: std.fs.Dir, path: *std.ArrayListUnmanaged(u8), parent_node: ?*const ignore.Node, ctx: anytype) anyerror!void {
+fn scanDir(w: *Walk, dir: std.Io.Dir, path: *std.ArrayListUnmanaged(u8), parent_node: ?*const ignore.Node, ctx: anytype) anyerror!void {
     const allocator = w.allocator;
     const prefix_len = path.items.len;
 
     // One listing pass, buffered: ignore files are detected from the entries
     // instead of a blind openat() per candidate, and the names must outlive the
     // iterator because rules load between listing and processing.
-    var names: std.ArrayListUnmanaged(u8) = .{};
+    var names: std.ArrayListUnmanaged(u8) = .empty;
     defer names.deinit(allocator);
-    var entries: std.ArrayListUnmanaged(Entry) = .{};
+    var entries: std.ArrayListUnmanaged(Entry) = .empty;
     defer entries.deinit(allocator);
     var found: ignore.Found = .{false} ** ignore.names.len;
 
     var it = dir.iterate();
-    while (try it.next()) |ent| {
+    while (try it.next(w.io)) |ent| {
         if (ent.kind != .file and ent.kind != .directory) continue;
         if (ent.kind == .file) {
             if (ignore.nameIndex(ent.name)) |i| found[i] = true;
@@ -267,8 +271,8 @@ fn scanDir(w: *Walk, dir: std.fs.Dir, path: *std.ArrayListUnmanaged(u8), parent_
         if (w.q.hasIdleWorker()) {
             w.q.push(allocator.dupe(u8, rel) catch continue, node);
         } else {
-            var sub = dir.openDir(name, .{ .iterate = true }) catch continue;
-            defer sub.close();
+            var sub = dir.openDir(w.io, name, .{ .iterate = true }) catch continue;
+            defer sub.close(w.io);
             scanDir(w, sub, path, node, ctx) catch {};
         }
     }
@@ -279,7 +283,7 @@ fn scanDir(w: *Walk, dir: std.fs.Dir, path: *std.ArrayListUnmanaged(u8), parent_
 const Entry = struct {
     off: u32,
     len: u32,
-    kind: std.fs.Dir.Entry.Kind,
+    kind: std.Io.File.Kind,
 
     fn name(self: Entry, buf: []const u8) []const u8 {
         return buf[self.off..][0..self.len];
@@ -307,13 +311,13 @@ fn excluded(path: []const u8, exclude: []const []const u8) bool {
 }
 
 const TestCollector = struct {
-    files: std.ArrayListUnmanaged([]const u8) = .{},
+    files: std.ArrayListUnmanaged([]const u8) = .empty,
     alloc: std.mem.Allocator,
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
 
     pub fn onFile(self: *@This(), path: []const u8) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(std.testing.io);
+        defer self.mu.unlock(std.testing.io);
         self.files.append(self.alloc, self.alloc.dupe(u8, path) catch return) catch {};
     }
 
@@ -327,19 +331,19 @@ test "walk files with include/exclude" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
 
-    try td.dir.makeDir("src");
-    try td.dir.makeDir("test");
-    try td.dir.writeFile(.{ .sub_path = "src/a.clj", .data = "x\n" });
-    try td.dir.writeFile(.{ .sub_path = "test/b.clj", .data = "x\n" });
+    try td.dir.createDir(std.testing.io, "src", .default_dir);
+    try td.dir.createDir(std.testing.io, "test", .default_dir);
+    try td.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.clj", .data = "x\n" });
+    try td.dir.writeFile(std.testing.io, .{ .sub_path = "test/b.clj", .data = "x\n" });
 
-    var set = ignore.Set.init(std.testing.allocator);
+    var set = ignore.Set.init(std.testing.allocator, std.testing.io);
     defer set.deinit();
     const root = try set.push(null, td.dir, "", ignore.all_found);
 
     var collector = TestCollector{ .alloc = std.testing.allocator };
     defer collector.deinit();
 
-    try walkFiles(std.testing.allocator, td.dir, &set, root, &.{"."}, &.{"src"}, &.{"test"}, false, 4, &collector);
+    try walkFiles(std.testing.allocator, std.testing.io, td.dir, &set, root, &.{"."}, &.{"src"}, &.{"test"}, false, 4, &collector);
 
     try std.testing.expectEqual(@as(usize, 1), collector.files.items.len);
     try std.testing.expect(std.mem.endsWith(u8, collector.files.items[0], "src/a.clj"));
@@ -349,17 +353,17 @@ test "include does not prune directories" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
 
-    try td.dir.makeDir("src");
-    try td.dir.writeFile(.{ .sub_path = "src/run.zig", .data = "x\n" });
+    try td.dir.createDir(std.testing.io, "src", .default_dir);
+    try td.dir.writeFile(std.testing.io, .{ .sub_path = "src/run.zig", .data = "x\n" });
 
-    var set = ignore.Set.init(std.testing.allocator);
+    var set = ignore.Set.init(std.testing.allocator, std.testing.io);
     defer set.deinit();
     const root = try set.push(null, td.dir, "", ignore.all_found);
 
     var collector = TestCollector{ .alloc = std.testing.allocator };
     defer collector.deinit();
 
-    try walkFiles(std.testing.allocator, td.dir, &set, root, &.{"."}, &.{"run"}, &.{}, false, 1, &collector);
+    try walkFiles(std.testing.allocator, std.testing.io, td.dir, &set, root, &.{"."}, &.{"run"}, &.{}, false, 1, &collector);
 
     try std.testing.expectEqual(@as(usize, 1), collector.files.items.len);
     try std.testing.expect(std.mem.endsWith(u8, collector.files.items[0], "src/run.zig"));
@@ -369,10 +373,10 @@ test "overlapping roots are walked once" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
 
-    try td.dir.makePath("sub/deep");
-    try td.dir.writeFile(.{ .sub_path = "top.txt", .data = "x\n" });
-    try td.dir.writeFile(.{ .sub_path = "sub/a.txt", .data = "x\n" });
-    try td.dir.writeFile(.{ .sub_path = "sub/deep/b.txt", .data = "x\n" });
+    try td.dir.createDirPath(std.testing.io, "sub/deep");
+    try td.dir.writeFile(std.testing.io, .{ .sub_path = "top.txt", .data = "x\n" });
+    try td.dir.writeFile(std.testing.io, .{ .sub_path = "sub/a.txt", .data = "x\n" });
+    try td.dir.writeFile(std.testing.io, .{ .sub_path = "sub/deep/b.txt", .data = "x\n" });
 
     const cases = [_][]const []const u8{
         &.{ ".", "sub" },
@@ -383,14 +387,14 @@ test "overlapping roots are walked once" {
     const expected = [_]usize{ 3, 3, 2, 2 };
 
     for (cases, expected) |roots, want| {
-        var set = ignore.Set.init(std.testing.allocator);
+        var set = ignore.Set.init(std.testing.allocator, std.testing.io);
         defer set.deinit();
         const root = try set.push(null, td.dir, "", ignore.all_found);
 
         var collector = TestCollector{ .alloc = std.testing.allocator };
         defer collector.deinit();
 
-        try walkFiles(std.testing.allocator, td.dir, &set, root, roots, &.{}, &.{}, false, 4, &collector);
+        try walkFiles(std.testing.allocator, std.testing.io, td.dir, &set, root, roots, &.{}, &.{}, false, 4, &collector);
         try std.testing.expectEqual(want, collector.files.items.len);
     }
 }
@@ -403,23 +407,23 @@ test "parallel walk finds every file in a deep tree" {
     var expected: usize = 0;
     for (0..12) |i| {
         const d = try std.fmt.bufPrint(&buf, "d{d}/sub/deeper", .{i});
-        try td.dir.makePath(d);
+        try td.dir.createDirPath(std.testing.io, d);
         for (0..7) |j| {
             const f = try std.fmt.bufPrint(&buf, "d{d}/sub/deeper/f{d}.txt", .{ i, j });
-            try td.dir.writeFile(.{ .sub_path = f, .data = "x\n" });
+            try td.dir.writeFile(std.testing.io, .{ .sub_path = f, .data = "x\n" });
             expected += 1;
         }
     }
 
     for ([_]usize{ 1, 2, 8, 64 }) |threads| {
-        var set = ignore.Set.init(std.testing.allocator);
+        var set = ignore.Set.init(std.testing.allocator, std.testing.io);
         defer set.deinit();
         const root = try set.push(null, td.dir, "", ignore.all_found);
 
         var collector = TestCollector{ .alloc = std.testing.allocator };
         defer collector.deinit();
 
-        try walkFiles(std.testing.allocator, td.dir, &set, root, &.{"."}, &.{}, &.{}, false, threads, &collector);
+        try walkFiles(std.testing.allocator, std.testing.io, td.dir, &set, root, &.{"."}, &.{}, &.{}, false, threads, &collector);
         try std.testing.expectEqual(expected, collector.files.items.len);
     }
 }
