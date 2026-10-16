@@ -4,7 +4,7 @@ const glob = @import("glob.zig");
 /// Per-directory ignore files, in load order.
 pub const names = [_][]const u8{ ".gitignore", ".rgignore", ".ignore" };
 pub const Found = [names.len]bool;
-pub const all_found: Found = .{true} ** names.len;
+pub const all_found: Found = @splat(true);
 
 /// Index into `names` if `name` is an ignore file.
 pub fn nameIndex(name: []const u8) ?usize {
@@ -214,5 +214,5 @@ test "chain honors per-dir ignore" {
     // A dir without ignore files must not allocate a node
     var b = try a.openDir(io, "b", .{ .iterate = true });
     defer b.close(io);
-    try std.testing.expectEqual(node_a, try set.push(node_a, b, "a/b", .{false} ** names.len));
+    try std.testing.expectEqual(node_a, try set.push(node_a, b, "a/b", @splat(false)));
 }

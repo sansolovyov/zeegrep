@@ -1,10 +1,7 @@
 const std = @import("std");
 const ansi = @import("core/ansi.zig");
 
-pub const c = @cImport({
-    @cDefine("PCRE2_CODE_UNIT_WIDTH", "8");
-    @cInclude("pcre2.h");
-});
+pub const c = @import("pcre2");
 
 pub const Code = struct {
     code: ?*c.pcre2_code_8 = null,

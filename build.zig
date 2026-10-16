@@ -13,6 +13,13 @@ pub fn build(b: *std.Build) void {
     const pcre2_lib = pcre2_dep.artifact("pcre2-8");
 
     const opt_dep = b.dependency("opt", .{});
+    const pcre2_c = b.addTranslateC(.{
+        .root_source_file = pcre2_dep.namedLazyPath("pcre2.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pcre2_c.defineCMacro("PCRE2_CODE_UNIT_WIDTH", "8");
+    const pcre2_module = pcre2_c.createModule();
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -21,9 +28,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize != .Debug,
+        .strip = optimize != .debug,
         .imports = &.{
             .{ .name = "opt", .module = opt_dep.module("opt") },
+            .{ .name = "pcre2", .module = pcre2_module },
         },
     });
     exe_module.addOptions("build_options", build_options);
@@ -41,7 +49,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run zg");
     run_step.dependOn(&run_cmd.step);
@@ -52,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "opt", .module = opt_dep.module("opt") },
+            .{ .name = "pcre2", .module = pcre2_module },
         },
     });
     const run_tests = b.addTest(.{ .root_module = run_test_module });
@@ -63,9 +72,10 @@ pub fn build(b: *std.Build) void {
 }
 
 fn gitVersion(b: *std.Build) []const u8 {
+    b.graph.poisonCache();
     const result = std.process.run(b.allocator, b.graph.io, .{
         .argv = &.{ "git", "describe", "--tags", "--always", "--dirty=+" },
-        .cwd = .{ .path = b.pathFromRoot(".") },
+        .cwd = .{ .path = b.root.toString(b.allocator) catch return "dev" },
     }) catch return "dev";
     switch (result.term) {
         .exited => |code| if (code != 0) return "dev",

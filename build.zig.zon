@@ -2,15 +2,15 @@
     .name = .zeegrep,
     // no idea how to sync this with tags used for releases
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .pcre2 = .{
-            .url = "git+https://github.com/PCRE2Project/pcre2?ref=pcre2-10.48#7978954dbd2efc6f2196869290553cf1871b4ce6",
-            .hash = "pcre2-10.48.0-IZ6r6xbVXgDEFDNJ-plJuG66pvQJIDeYdflXi2zQHoET",
+            .url = "git+https://github.com/PCRE2Project/pcre2#9ad4a2e956876747a5022bf04614c7e39e71d4ec",
+            .hash = "pcre2-10.50.0-DEV-IZ6r6yDTrgCmI3jcBntPIdZLWLhNORGZZSi8hxQkc11x",
         },
         .opt = .{
-            .url = "https://github.com/piranha/opt.zig/archive/cf51b901611540e8c4b30a9842bea24f6c8aa4dc.tar.gz",
-            .hash = "opt-0.2.0-mfhJVdnzAAAG_qGbCcu2bM2UQ1gn4vlqlmqmNFIPQXly",
+            .url = "git+https://github.com/piranha/opt.zig#86be1a12c791eb13b53faab233f405ff62de067f",
+            .hash = "opt-0.2.0-mfhJVaz4AAAmHD7lSYyZ5wRyeMbOBrRU0TjnP0bod707",
         },
     },
     .paths = .{""},

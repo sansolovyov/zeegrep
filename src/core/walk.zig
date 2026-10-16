@@ -229,7 +229,7 @@ fn scanDir(w: *Walk, dir: std.Io.Dir, path: *std.ArrayListUnmanaged(u8), parent_
     defer names.deinit(allocator);
     var entries: std.ArrayListUnmanaged(Entry) = .empty;
     defer entries.deinit(allocator);
-    var found: ignore.Found = .{false} ** ignore.names.len;
+    var found: ignore.Found = @splat(false);
 
     var it = dir.iterate();
     while (try it.next(w.io)) |ent| {

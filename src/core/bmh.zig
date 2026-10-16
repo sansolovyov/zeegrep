@@ -173,12 +173,12 @@ test "bench bmh vs naive" {
     const alloc = std.testing.allocator;
 
     // Generate ~1MB haystack with pattern every ~1KB
-    const chunk = "abcdefghijklmnopqrstuvwxyz0123456789_" ** 28; // ~1KB
+    const chunk: [28][37]u8 = @splat("abcdefghijklmnopqrstuvwxyz0123456789_".*); // ~1KB
     const needle = "PATTERN_HERE";
     var hay: std.ArrayListUnmanaged(u8) = .empty;
     defer hay.deinit(alloc);
     for (0..1000) |_| {
-        try hay.appendSlice(alloc, chunk);
+        try hay.appendSlice(alloc, std.mem.asBytes(&chunk));
         try hay.appendSlice(alloc, needle);
     }
     const data = hay.items;

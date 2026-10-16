@@ -19,10 +19,10 @@ pub fn main(init: std.process.Init) !void {
     // libc malloc has per-thread caches; the debug allocator serializes every
     // path dupe/job closure on one mutex (~40% of walk time on big trees).
     var dbg: std.heap.DebugAllocator(.{}) = .init;
-    defer if (builtin.mode == .Debug) {
+    defer if (builtin.mode == .debug) {
         _ = dbg.deinit();
     };
-    const allocator = if (builtin.mode == .Debug) dbg.allocator() else std.heap.c_allocator;
+    const allocator = if (builtin.mode == .debug) dbg.allocator() else std.heap.c_allocator;
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
